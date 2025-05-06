@@ -1,7 +1,6 @@
 import streamlit as st
 import openai
 import os
-import tempfile
 import pdfplumber
 from dotenv import load_dotenv
 from langchain_community.embeddings import OpenAIEmbeddings
@@ -9,13 +8,14 @@ from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
+from langchain.schema import Document
 
 # Load OpenAI API key
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 st.set_page_config(page_title="📚 Multi-PDF Chatbot", page_icon="🧠")
-st.title("🧠 Chat with Multiple PDFs")
+st.title("🤖 Chat with PDFs")
 
 # Session state setup
 if "vectorstore" not in st.session_state:
@@ -27,55 +27,46 @@ if "qa_chain" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = set()
-
-clear_chat = st.checkbox("Clear chat history when uploading new PDF", value=False)
-
-# Function to process and add PDF to vectorstore
-def ingest_pdf(file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(file.read())
-        pdf_path = tmp_file.name
-
-    # Extract text
-    with pdfplumber.open(pdf_path) as pdf:
-        text = "\n".join([page.extract_text() or "" for page in pdf.pages])
-
-    # Split into chunks
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    docs = splitter.create_documents([text])
-
-    # Create embeddings
-    embeddings = OpenAIEmbeddings()
-
-    # Initialize or add to existing vector store
-    if st.session_state.vectorstore is None:
-        st.session_state.vectorstore = FAISS.from_documents(docs, embeddings)
-    else:
-        st.session_state.vectorstore.add_documents(docs)
-
-    # Update the retrieval chain
-    st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=ChatOpenAI(temperature=0),
-        retriever=st.session_state.vectorstore.as_retriever(),
-        return_source_documents=False
+# --- Function to read and chunk PDFs ---
+def load_and_chunk_pdfs(folder_path="./pdfs"):
+    all_chunks = []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, chunk_overlap=150,
+        separators=["\n\n", "\n", ".", " ", ""]
     )
 
-# Upload and ingest PDFs
-uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
-if uploaded_file and uploaded_file.name not in st.session_state.uploaded_files:
-    ingest_pdf(uploaded_file)
-    st.session_state.uploaded_files.add(uploaded_file.name)
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".pdf"):
+            pdf_path = os.path.join(folder_path, filename)
+            with pdfplumber.open(pdf_path) as pdf:
+                full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
+                if full_text.strip():
+                    doc = Document(page_content=full_text, metadata={"source": filename})
+                    chunks = splitter.split_documents([doc])
+                    all_chunks.extend(chunks)
 
-    if clear_chat:
-        st.session_state.chat_history = []
+    return all_chunks
 
-    st.success(f"Ingested '{uploaded_file.name}' successfully!")
+# --- Ingest all PDFs at app startup ---
+if st.session_state.vectorstore is None:
+    with st.spinner("Loading PDFs..."):
+        all_chunks = load_and_chunk_pdfs("./pdfs")
 
-# Chat interface
+        if all_chunks:
+            embeddings = OpenAIEmbeddings()
+            st.session_state.vectorstore = FAISS.from_documents(all_chunks, embeddings)
+            st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+                llm=ChatOpenAI(temperature=0),
+                retriever=st.session_state.vectorstore.as_retriever(),
+                return_source_documents=False
+            )
+            st.success("All PDFs loaded and ready for chat!")
+        else:
+            st.error("No text extracted from any PDFs. Check contents.")
+
+# --- Chat UI ---
 if st.session_state.qa_chain:
-    user_input = st.chat_input("Ask your question:")
+    user_input = st.chat_input("Ask a question based on the PDFs...")
     if user_input:
         result = st.session_state.qa_chain({
             "question": user_input,
@@ -84,7 +75,7 @@ if st.session_state.qa_chain:
         answer = result["answer"]
         st.session_state.chat_history.append((user_input, answer))
 
-# Show chat history
+# --- Show chat history ---
 for user_msg, bot_msg in st.session_state.chat_history:
     with st.chat_message("user"):
         st.markdown(user_msg)
